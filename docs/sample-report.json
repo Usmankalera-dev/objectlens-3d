@@ -1,0 +1,32 @@
+{
+  "mode": "visual_hull",
+  "views_used": 12,
+  "angles_deg": [
+    0.0,
+    30.0,
+    60.0,
+    90.0,
+    120.0,
+    150.0,
+    180.0,
+    210.0,
+    240.0,
+    270.0,
+    300.0,
+    330.0
+  ],
+  "px_per_mm": 5.975,
+  "axis_cx_px": 500.0,
+  "ground_cy_px": 820.0,
+  "grid": 96,
+  "voxel_mm": 1.323,
+  "voxel_count": 70516,
+  "surface_points": 8684,
+  "dimensions_mm": {
+    "width_x": 60.87,
+    "height_y": 111.15,
+    "depth_z": 42.34
+  },
+  "mesh_vertices": 11668,
+  "mesh_faces": 23178
+}

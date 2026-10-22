@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ObjectLens 3D — Webcam Object Scanner with True mm Measurements</title>
+<meta name="description" content="Scan any object with a webcam: ArUco-calibrated millimetre measurements, hand tracking and multi-view 3D reconstruction.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="hero">
+  <div class="logo">◈ ObjectLens <span>3D</span></div>
+  <h1>Point a webcam. Get a <em>measured</em> 3D model.</h1>
+  <p class="sub">Most webcam scanners guess sizes. ObjectLens 3D calibrates against a printed
+     ArUco marker, so every measurement is in <strong>true millimetres</strong> — then carves a
+     3D visual hull from your silhouettes.</p>
+  <div class="badges">
+    <span>📐 ArUco true-mm scale</span><span>✋ Hand tracking</span>
+    <span>🧊 Visual-hull 3D</span><span>🎯 Tested vs ground truth</span>
+  </div>
+</header>
+
+<main>
+  <!-- LIVE SCANNER -->
+  <section class="card" id="live">
+    <h2>1 · Live scanner <small>your webcam, in the browser</small></h2>
+    <div class="stage">
+      <video id="cam" autoplay playsinline muted></video>
+      <canvas id="overlay"></canvas>
+      <div id="nocam" class="nocam">
+        <p>📷 <strong>No camera yet.</strong></p>
+        <p>Click <em>Start camera</em> and allow access. On this preview machine there is no
+           webcam attached, so this placeholder is expected — the panel below still shows a
+           real scan produced by the Python pipeline.</p>
+      </div>
+    </div>
+    <div class="controls">
+      <button id="btnCam" class="primary">Start camera</button>
+      <label class="switch"><input type="checkbox" id="chkHands" checked> Hand landmarks</label>
+      <label class="switch"><input type="checkbox" id="chkObjects" checked> Object boxes (COCO-SSD)</label>
+      <span id="status" class="status">idle</span>
+    </div>
+    <p class="hint">Live mode detects hands (MediaPipe, 21 landmarks) and everyday objects
+       (TensorFlow.js COCO-SSD). For measured scans and 3D, use the Python pipeline below.</p>
+  </section>
+
+  <!-- SAMPLE SCAN -->
+  <section class="card" id="sample">
+    <h2>2 · Sample scan <small>drag to rotate · scroll to zoom</small></h2>
+    <div id="viewer"></div>
+    <div class="dims" id="dims">
+      <div><span class="k">Width (X)</span><span class="v" id="dimX">—</span></div>
+      <div><span class="k">Height (Y)</span><span class="v" id="dimY">—</span></div>
+      <div><span class="k">Depth (Z)</span><span class="v" id="dimZ">—</span></div>
+      <div><span class="k">Views used</span><span class="v" id="dimViews">—</span></div>
+      <div><span class="k">Mesh faces</span><span class="v" id="dimFaces">—</span></div>
+    </div>
+    <p class="hint">This bottle was reconstructed by the Python pipeline from 12 rotated views and
+       measured against the ArUco scale. It is a <strong>synthetic test scene with exact ground
+       truth</strong> (60 × 110 × 42 mm): the pipeline recovered it with errors of
+       <strong>0.3–1.2 mm</strong>. <a href="sample.ply" download>Download the PLY</a> ·
+       <a href="sample-report.json" target="_blank">Scan report (JSON)</a></p>
+  </section>
+
+  <!-- HOW IT WORKS -->
+  <section class="card" id="how">
+    <h2>3 · How it works</h2>
+    <ol class="steps">
+      <li><strong>Print the marker.</strong> A 40&nbsp;mm ArUco square
+          (<a href="marker.png" download>marker.png</a>, print at 100%). Check it with a ruler —
+          if your printer scaled it, just tell the scanner the real size.</li>
+      <li><strong>Measure in one photo.</strong> Marker + object in one shot → the marker gives
+          px-per-mm at that plane → the object's box becomes true millimetres.</li>
+      <li><strong>Rotate &amp; shoot ±12 views.</strong> Turn the object ~30° at a time on a plain
+          background. Silhouettes are segmented automatically.</li>
+      <li><strong>Carve the hull.</strong> A 96³ voxel volume keeps only voxels inside every
+          silhouette — the visual hull — exported as a PLY point cloud or mesh.</li>
+    </ol>
+    <h3>Run it yourself</h3>
+    <pre>python make_marker.py --size-mm 40
+python scan.py measure photo.jpg --marker-mm 40
+python scan.py hull view_*.png --step 30 --marker-mm 40 --mesh</pre>
+
+    <h2 class="mt">Honest limitations</h2>
+    <ul class="limits">
+      <li><strong>Single-plane scale:</strong> the marker calibrates the plane it sits in. An object
+          much closer to / farther from the camera than the marker will be off by the depth ratio.</li>
+      <li><strong>Silhouettes are approximate:</strong> a visual hull can never carve concavities
+          (dents, holes, the inside of a mug) — it is the object's outer shell, not a LiDAR scan.</li>
+      <li><strong>Occlusions &amp; background:</strong> parts hidden in a view stay "unknown"; busy or
+          similarly-coloured backgrounds break segmentation. Plain background, good light.</li>
+      <li><strong>Test numbers are synthetic:</strong> accuracy above was measured on rendered scenes
+          with exact ground truth, not on a physical product. Real-world error will be larger.</li>
+    </ul>
+  </section>
+</main>
+
+<footer>
+  <p>ObjectLens 3D · built by <strong>Usman Kalera</strong> ·
+     Python · OpenCV ArUco · MediaPipe · three.js · TensorFlow.js</p>
+</footer>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+<script src="app.js"></script>
+<script type="importmap">
+{ "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+} }
+</script>
+<script type="module" src="viewer.js"></script>
+</body>
+</html>
