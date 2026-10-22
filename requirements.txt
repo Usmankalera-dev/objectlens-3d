@@ -1,0 +1,6 @@
+numpy>=1.26
+opencv-contrib-python>=4.9   # includes the ArUco module
+Pillow>=10
+scikit-image>=0.22            # marching cubes mesh export
+mediapipe>=0.10               # hand_demo.py (Tasks API HandLandmarker)
+# optional: ultralytics       # only for scan.py measure --yolo fallback
