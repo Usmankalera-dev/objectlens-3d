@@ -62,9 +62,54 @@
        <a href="sample-report.json" target="_blank">Scan report (JSON)</a></p>
   </section>
 
+  <!-- SCAN YOUR OWN VIDEO -->
+  <section class="card" id="scan">
+    <h2>3 · Scan your own video <small>100% in your browser — nothing is uploaded</small></h2>
+    <p class="hint top">Record <strong>one object rotating a full 360° turn</strong> on a plain
+       background with a <strong>fixed camera</strong> (a turntable clip is perfect). The clip —
+       or the start–end range below — is treated as exactly one full turn: frames are sampled
+       evenly, silhouettes are cut by background colour, and a visual hull is carved right here
+       in JavaScript.</p>
+
+    <div id="drop" class="drop">
+      <input type="file" id="fileVideo" accept="video/*" hidden>
+      <p class="dropMain">🎬 <strong>Drop a video here</strong> or
+         <button type="button" id="btnBrowse" class="linkbtn">browse…</button></p>
+      <p class="dropSub" id="fileName">MP4 / WebM — processed locally on your machine, never uploaded.</p>
+    </div>
+
+    <div class="controls scanControls">
+      <label>Views <input type="number" id="inViews" value="12" min="4" max="36" step="1"></label>
+      <label>Background threshold
+        <input type="range" id="inThresh" min="10" max="120" value="40" step="1">
+        <span id="threshVal">40</span></label>
+      <label>Start (s) <input type="number" id="inStart" value="0" min="0" step="0.1"></label>
+      <label>End (s) <input type="number" id="inEnd" value="0" min="0" step="0.1"></label>
+      <span class="ctlNote">End = 0 means the whole clip.</span>
+    </div>
+    <div class="controls">
+      <button id="btnBuild" class="primary" disabled>Build 3D model</button>
+      <button id="btnPly" class="ghost" disabled>Download PLY</button>
+      <span id="scanStatus" class="status">no video loaded</span>
+    </div>
+    <p id="scanError" class="scanError" hidden></p>
+    <div id="thumbs" class="thumbs"></div>
+    <div id="scanViewer" hidden></div>
+    <div class="dims" id="scanDims" hidden>
+      <div><span class="k">Width (X)</span><span class="v" id="sDimX">—</span></div>
+      <div><span class="k">Height (Y)</span><span class="v" id="sDimY">1.00</span></div>
+      <div><span class="k">Depth (Z)</span><span class="v" id="sDimZ">—</span></div>
+      <div><span class="k">Views used</span><span class="v" id="sDimViews">—</span></div>
+      <div><span class="k">Surface points</span><span class="v" id="sDimPts">—</span></div>
+    </div>
+    <p class="hint"><strong>Relative units</strong> — this video has no ArUco marker, so true
+       millimetres are not possible from video alone. Height is normalised to 1.00 and width /
+       depth are ratios of it. For true-mm scans, use the marker workflow in the next section.</p>
+  </section>
+
   <!-- HOW IT WORKS -->
   <section class="card" id="how">
-    <h2>3 · How it works</h2>
+    <h2>4 · How it works</h2>
     <ol class="steps">
       <li><strong>Print the marker.</strong> A 40&nbsp;mm ArUco square
           (<a href="marker.png" download>marker.png</a>, print at 100%). Check it with a ruler —
@@ -113,5 +158,6 @@ python scan.py hull view_*.png --step 30 --marker-mm 40 --mesh</pre>
 } }
 </script>
 <script type="module" src="viewer.js"></script>
+<script type="module" src="scan.js"></script>
 </body>
 </html>
