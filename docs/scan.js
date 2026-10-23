@@ -7,18 +7,24 @@
 //   4. derive the rotation axis (median centroid column) and ground row,
 //   5. carve a voxel visual hull with orthographic projection,
 //   6. show the surface points in three.js and export them as PLY.
-// There is no ArUco marker in a video, so dimensions are RELATIVE
-// (height = 1.00). Nothing is uploaded - everything runs locally.
+// If a printed ArUco marker (OpenCV DICT_4X4_50, the Python pipeline's
+// dictionary - vendored js-aruco2 under vendor/) is visible in any sampled
+// frame, the most frontal detection calibrates px-per-mm and dimensions
+// come out in TRUE millimetres; the marker quad is cut out of the masks
+// so it can never merge with the object. Without a marker, dimensions
+// stay RELATIVE (height = 1.00). Nothing is uploaded - all local.
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
 const $ = id => document.getElementById(id);
 const dropEl = $('drop'), fileEl = $('fileVideo'), fileNameEl = $('fileName');
 const viewsEl = $('inViews'), threshEl = $('inThresh'), threshValEl = $('threshVal');
-const startEl = $('inStart'), endEl = $('inEnd');
+const startEl = $('inStart'), endEl = $('inEnd'), markerMmEl = $('inMarkerMm');
 const buildEl = $('btnBuild'), plyEl = $('btnPly');
-const statusEl = $('scanStatus'), errorEl = $('scanError');
+const statusEl = $('scanStatus'), errorEl = $('scanError'), calibEl = $('calibStatus');
 const thumbsEl = $('thumbs'), viewerEl = $('scanViewer'), dimsEl = $('scanDims');
+const relNoteEl = $('relNote');
+const REL_NOTE_DEFAULT = relNoteEl.innerHTML;
 
 const GRID = 64;          // voxel grid (64^3) - fast enough in JS
 const MAX_W = 640;        // processing width cap for speed
@@ -33,6 +39,7 @@ const fctx = fc.getContext('2d', { willReadFrequently: true });
 
 let videoURL = null;
 let lastPoints = null;    // Float32Array, relative units (height = 1)
+let lastCalib = null;     // null, or {pxPerMm, heightPx, frames, markerId}
 let three = null;         // three.js bits, created on first result
 let pointsObj = null;
 
@@ -97,11 +104,87 @@ function seekTo(t) {
   });
 }
 
+// ------------------------------------------------------------ ArUco markers
+// Vendored js-aruco2 (vendor/js-aruco2/) as classic scripts -> window.AR.
+// The registered dictionary 'ARUCO_4X4_50' is bit-for-bit OpenCV's
+// DICT_4X4_50 (see the header of vendor/js-aruco2/aruco_4x4_50.js).
+let arDetector = null, arBroken = false;
+function getDetector() {
+  if (arDetector || arBroken) return arDetector;
+  try {
+    if (window.AR && AR.Detector) arDetector = new AR.Detector({ dictionaryName: 'ARUCO_4X4_50' });
+    else arBroken = true;
+  } catch (e) { arBroken = true; }
+  return arDetector;
+}
+
+// Score one detected quad: squareness = 16*area / perimeter^2 (1.0 for a
+// perfect square, less as perspective slant grows) with the mean edge.
+function quadStats(c) {
+  let per = 0; const edges = [];
+  for (let i = 0; i < 4; i++) {
+    const a = c[i], b = c[(i + 1) % 4];
+    const e = Math.hypot(b.x - a.x, b.y - a.y);
+    edges.push(e); per += e;
+  }
+  let area = 0;
+  for (let i = 0; i < 4; i++) {
+    const a = c[i], b = c[(i + 1) % 4];
+    area += a.x * b.y - b.x * a.y;
+  }
+  area = Math.abs(area) / 2;
+  return { meanEdge: per / 4, squareness: per > 0 ? 16 * area / (per * per) : 0, area };
+}
+
+// Run detection on one already-drawn frame (RGBA ImageData).
+// Returns { quads, best } - every marker quad (for mask exclusion) and the
+// single most frontal detection of this frame, or null.
+function detectMarkers(imgData) {
+  const det = getDetector();
+  if (!det) return { quads: [], best: null };
+  let found = [];
+  try { found = det.detect({ width: imgData.width, height: imgData.height, data: imgData.data }) || []; }
+  catch (e) { return { quads: [], best: null }; }
+  const quads = [], scored = [];
+  for (const mk of found) {
+    if (!mk.corners || mk.corners.length !== 4) continue;
+    const st = quadStats(mk.corners);
+    quads.push(mk.corners);
+    scored.push({ id: mk.id, corners: mk.corners, ...st });
+  }
+  scored.sort((a, b) => (b.squareness - a.squareness) || (b.area - a.area));
+  return { quads, best: scored[0] || null };
+}
+
+// Cut marker quads out of a raw mask (before the largest-component step),
+// so a marker leaning against the object can never join its silhouette.
+// Quads are convex; corners are pushed 3% away from the centroid first.
+function excludeQuads(mask, w, h, quads) {
+  for (const q of quads) {
+    const gx = (q[0].x + q[1].x + q[2].x + q[3].x) / 4;
+    const gy = (q[0].y + q[1].y + q[2].y + q[3].y) / 4;
+    const ex = q.map(p => ({ x: gx + (p.x - gx) * 1.06, y: gy + (p.y - gy) * 1.06 }));
+    const x0 = Math.max(0, Math.floor(Math.min(...ex.map(p => p.x))));
+    const x1 = Math.min(w - 1, Math.ceil(Math.max(...ex.map(p => p.x))));
+    const y0 = Math.max(0, Math.floor(Math.min(...ex.map(p => p.y))));
+    const y1 = Math.min(h - 1, Math.ceil(Math.max(...ex.map(p => p.y))));
+    for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+      let pos = true, neg = true;
+      for (let i = 0; i < 4; i++) {
+        const a = ex[i], b = ex[(i + 1) % 4];
+        const cr = (b.x - a.x) * (y - a.y) - (b.y - a.y) * (x - a.x);
+        if (cr > 0) neg = false; else if (cr < 0) pos = false;
+      }
+      if (pos || neg) mask[y * w + x] = 0;
+    }
+  }
+}
+
 // -------------------------------------------------------------- segmentation
 // Same recipe as the Python pipeline: background colour from the corners,
 // colour-distance threshold, largest connected component, hole filling.
-function segmentFrame(w, h, thresh) {
-  const data = fctx.getImageData(0, 0, w, h).data;
+// `data` is the frame's RGBA bytes; `quads` are marker quads to cut out.
+function segmentFrame(data, w, h, thresh, quads) {
   // background colour: mean of each corner patch, median across patches
   const p = Math.max(4, Math.floor(Math.min(w, h) / 20));
   const patches = [[0, 0], [w - p, 0], [0, h - p], [w - p, h - p]];
@@ -120,6 +203,7 @@ function segmentFrame(w, h, thresh) {
     const dr = data[i] - bg[0], dg = data[i + 1] - bg[1], db = data[i + 2] - bg[2];
     if (dr * dr + dg * dg + db * db > t2) mask[px] = 1;
   }
+  if (quads && quads.length) excludeQuads(mask, w, h, quads);
   const clean = largestComponent(mask, w, h);
   fillHoles(clean, w, h);
   // stats in one pass
@@ -268,7 +352,8 @@ async function carveHull(masks, w, h, cx, cy, onProgress) {
     rel[i + 2] = (pts[i + 2] - czRel) * s;
   }
   return { points: rel, voxelCount: aliveCount,
-           dims: { x: widthPx * s, y: 1, z: depthPx * s }, voxRel: vox * s };
+           dims: { x: widthPx * s, y: 1, z: depthPx * s }, voxRel: vox * s,
+           dimsPx: { x: widthPx, y: heightPx, z: depthPx } };
 }
 
 // -------------------------------------------------------------------- viewer
@@ -319,12 +404,16 @@ function showResult(points, voxRel) {
 plyEl.addEventListener('click', () => {
   if (!lastPoints) return;
   const n = lastPoints.length / 3;
-  let out = 'ply\nformat ascii 1.0\n' +
-    'comment ObjectLens 3D browser scan - RELATIVE units, height = 1.0 (no ArUco marker in video)\n' +
+  // calibrated: rel points are height-normalised, so mm = rel * height in mm
+  const f = lastCalib ? lastCalib.heightPx / lastCalib.pxPerMm : 1;
+  const comment = lastCalib
+    ? `comment ObjectLens 3D browser scan - units are MILLIMETRES (ArUco-calibrated, ${lastCalib.pxPerMm.toFixed(2)} px/mm)`
+    : 'comment ObjectLens 3D browser scan - RELATIVE units, height = 1.0 (no ArUco marker in video)';
+  let out = 'ply\nformat ascii 1.0\n' + comment + '\n' +
     `element vertex ${n}\nproperty float x\nproperty float y\nproperty float z\n` +
     'property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n';
   for (let i = 0; i < lastPoints.length; i += 3) {
-    out += `${lastPoints[i].toFixed(4)} ${lastPoints[i + 1].toFixed(4)} ${lastPoints[i + 2].toFixed(4)} 0 255 160\n`;
+    out += `${(lastPoints[i] * f).toFixed(4)} ${(lastPoints[i + 1] * f).toFixed(4)} ${(lastPoints[i + 2] * f).toFixed(4)} 0 255 160\n`;
   }
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob([out], { type: 'text/plain' }));
@@ -340,9 +429,14 @@ buildEl.addEventListener('click', async () => {
   dimsEl.hidden = true;
   plyEl.disabled = true;
   lastPoints = null;
+  lastCalib = null;
+  calibEl.hidden = true;
+  calibEl.classList.remove('none');
+  relNoteEl.innerHTML = REL_NOTE_DEFAULT;
 
   const views = Math.max(4, Math.min(36, parseInt(viewsEl.value, 10) || 12));
   const thresh = parseFloat(threshEl.value) || 40;
+  const markerMm = Math.max(1, parseFloat(markerMmEl.value) || 40);
   const dur = vid.duration;
   let t0 = parseFloat(startEl.value) || 0;
   let t1 = parseFloat(endEl.value) || 0;
@@ -360,6 +454,7 @@ buildEl.addEventListener('click', async () => {
     const W = Math.round(vid.videoWidth * scale), H = Math.round(vid.videoHeight * scale);
     fc.width = W; fc.height = H;
     const masks = [];
+    let bestDet = null, markerFrames = 0;
     for (let i = 0; i < views; i++) {
       const t = Math.min(t0 + (t1 - t0) * i / views, dur - 0.05);
       const angle = i * 360 / views;
@@ -367,7 +462,16 @@ buildEl.addEventListener('click', async () => {
       await seekTo(t);
       await new Promise(r => requestAnimationFrame(r));
       fctx.drawImage(vid, 0, 0, W, H);
-      const seg = segmentFrame(W, H, thresh);
+      const imgData = fctx.getImageData(0, 0, W, H);
+      const det = detectMarkers(imgData);
+      if (det.best) {
+        markerFrames++;
+        if (!bestDet || det.best.squareness > bestDet.squareness ||
+            (det.best.squareness === bestDet.squareness && det.best.area > bestDet.area)) {
+          bestDet = det.best;
+        }
+      }
+      const seg = segmentFrame(imgData.data, W, H, thresh, det.quads);
       masks.push(seg);
       addThumb(seg, W, H, angle);
       await tick();
@@ -409,16 +513,39 @@ buildEl.addEventListener('click', async () => {
     }
     lastPoints = res.points;
     showResult(res.points, res.voxRel);
-    $('sDimX').textContent = res.dims.x.toFixed(2);
-    $('sDimY').textContent = '1.00';
-    $('sDimZ').textContent = res.dims.z.toFixed(2);
+    // ArUco calibration: the most frontal marker detection sets px-per-mm;
+    // hull pixel dims / px-per-mm = true millimetres.
+    if (bestDet && markerFrames > 0) {
+      const pxPerMm = bestDet.meanEdge / markerMm;
+      lastCalib = { pxPerMm, heightPx: res.dimsPx.y, frames: markerFrames,
+                    markerId: bestDet.id };
+      $('sDimX').textContent = (res.dimsPx.x / pxPerMm).toFixed(1) + ' mm';
+      $('sDimY').textContent = (res.dimsPx.y / pxPerMm).toFixed(1) + ' mm';
+      $('sDimZ').textContent = (res.dimsPx.z / pxPerMm).toFixed(1) + ' mm';
+      calibEl.textContent = `✓ Calibrated by ArUco marker (${markerFrames} frame${markerFrames === 1 ? '' : 's'}, ` +
+        `${pxPerMm.toFixed(2)} px/mm) — sizes above are true millimetres.`;
+      calibEl.hidden = false;
+      relNoteEl.innerHTML = '<strong>True millimetres</strong> — an ArUco marker calibrated ' +
+        'this scan. Relative proportions (height = 1.00): ' +
+        `${res.dims.x.toFixed(2)} × 1.00 × ${res.dims.z.toFixed(2)}. ` +
+        'Single-plane caveat: the scale is exact at the marker\'s distance from the camera.';
+    } else {
+      $('sDimX').textContent = res.dims.x.toFixed(2);
+      $('sDimY').textContent = '1.00';
+      $('sDimZ').textContent = res.dims.z.toFixed(2);
+      calibEl.textContent = 'No ArUco marker found in the sampled frames — showing relative units. ' +
+        'Print the marker (section 4), stand it beside the object and keep it visible to get true millimetres.';
+      calibEl.classList.add('none');
+      calibEl.hidden = false;
+    }
     $('sDimViews').textContent = views;
     $('sDimPts').textContent = (res.points.length / 3).toLocaleString();
     dimsEl.hidden = false;
     plyEl.disabled = false;
     const secs = ((performance.now() - tBegin) / 1000).toFixed(1);
     setStatus(`done in ${secs} s — ${res.voxelCount.toLocaleString()} voxels carved, ` +
-      `${(res.points.length / 3).toLocaleString()} surface points (relative units)`);
+      `${(res.points.length / 3).toLocaleString()} surface points ` +
+      (lastCalib ? '(true mm — ArUco calibrated)' : '(relative units)'));
   } catch (e) {
     showError(e.message || 'Something went wrong while processing this video.');
     setStatus('failed');

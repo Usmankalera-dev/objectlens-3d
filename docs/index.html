@@ -70,6 +70,11 @@
        or the start–end range below — is treated as exactly one full turn: frames are sampled
        evenly, silhouettes are cut by background colour, and a visual hull is carved right here
        in JavaScript.</p>
+    <p class="hint top">📐 <strong>Want true millimetres?</strong> Print the
+       <a href="marker.png" download>ArUco marker</a> (section 4, step 1), stand it
+       <strong>beside the object — not touching it</strong>, and keep it visible in the video.
+       If the marker is found in any sampled frame, the sizes below come out in
+       <strong>true mm</strong>; without a marker they are relative units.</p>
 
     <div id="drop" class="drop">
       <input type="file" id="fileVideo" accept="video/*" hidden>
@@ -85,13 +90,15 @@
         <span id="threshVal">40</span></label>
       <label>Start (s) <input type="number" id="inStart" value="0" min="0" step="0.1"></label>
       <label>End (s) <input type="number" id="inEnd" value="0" min="0" step="0.1"></label>
-      <span class="ctlNote">End = 0 means the whole clip.</span>
+      <label>Marker size (mm) <input type="number" id="inMarkerMm" value="40" min="5" max="500" step="1"></label>
+      <span class="ctlNote">End = 0 means the whole clip. Marker size = the printed black square, measured with a ruler.</span>
     </div>
     <div class="controls">
       <button id="btnBuild" class="primary" disabled>Build 3D model</button>
       <button id="btnPly" class="ghost" disabled>Download PLY</button>
       <span id="scanStatus" class="status">no video loaded</span>
     </div>
+    <p id="calibStatus" class="calib" hidden></p>
     <p id="scanError" class="scanError" hidden></p>
     <div id="thumbs" class="thumbs"></div>
     <div id="scanViewer" hidden></div>
@@ -102,9 +109,10 @@
       <div><span class="k">Views used</span><span class="v" id="sDimViews">—</span></div>
       <div><span class="k">Surface points</span><span class="v" id="sDimPts">—</span></div>
     </div>
-    <p class="hint"><strong>Relative units</strong> — this video has no ArUco marker, so true
-       millimetres are not possible from video alone. Height is normalised to 1.00 and width /
-       depth are ratios of it. For true-mm scans, use the marker workflow in the next section.</p>
+    <p class="hint" id="relNote"><strong>Relative units</strong> — if no ArUco marker is visible
+       in the video, true millimetres are not possible from video alone: height is normalised
+       to 1.00 and width / depth are ratios of it. Print the marker and film it beside your
+       object (see above) to get true-mm sizes right here in the browser.</p>
   </section>
 
   <!-- HOW IT WORKS -->
@@ -157,6 +165,9 @@ python scan.py hull view_*.png --step 30 --marker-mm 40 --mesh</pre>
     "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
 } }
 </script>
+<script src="vendor/js-aruco2/cv.js"></script>
+<script src="vendor/js-aruco2/aruco.js"></script>
+<script src="vendor/js-aruco2/aruco_4x4_50.js"></script>
 <script type="module" src="viewer.js"></script>
 <script type="module" src="scan.js"></script>
 </body>

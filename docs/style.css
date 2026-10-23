@@ -66,6 +66,9 @@ button.ghost{background:transparent;color:var(--accent);border:1px solid var(--a
 button.ghost:disabled{opacity:.45;cursor:default}
 .scanError{background:#2b1218;border:1px solid #7a2233;color:#ffb3c0;border-radius:10px;
   padding:11px 14px;font-size:14.5px;margin:12px 0 0}
+.calib{background:#0d2b1e;border:1px solid #14663f;color:#8df5c3;border-radius:10px;
+  padding:11px 14px;font-size:14.5px;margin:12px 0 0}
+.calib.none{background:var(--panel);border-color:var(--line);color:var(--muted)}
 .thumbs{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
 .thumbs:empty{margin-top:0}
 .thumbs figure{margin:0;text-align:center}
