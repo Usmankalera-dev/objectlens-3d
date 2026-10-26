@@ -1,8 +1,9 @@
 // ObjectLens 3D - "Scan your own video": fully in-browser visual hull.
 // Mirrors the Python pipeline (objectlens/segment.py + hull.py):
 //   1. sample N frames evenly across one full 360-degree turn,
-//   2. segment each silhouette by background-colour distance
-//      (background = median of the four corner patches, like measure.py),
+//   2. segment each silhouette by edge detection (Sobel row fill),
+//      falling back to background-colour distance (median of the four
+//      corner patches, like measure.py) if the edge masks are implausible,
 //   3. keep the largest blob, fill holes,
 //   4. derive the rotation axis (median centroid column) and ground row,
 //   5. carve a voxel visual hull with orthographic projection,
@@ -258,6 +259,99 @@ function fillHoles(mask, w, h) {
   for (let i = 0; i < w * h; i++) if (!mask[i] && !seen[i]) mask[i] = 1;
 }
 
+// ------------------------------------------------- edge segmentation
+// For transparent objects (glass) on a gradient background, background-
+// colour distance fails: the glass interior is almost the background
+// colour, and the gradient itself is counted as foreground, so the mask
+// becomes a wide static blob and the carved hull collapses to a flat
+// disc. Edges do not have that problem: the background gradient is
+// smooth (low Sobel magnitude) while the object's outline is sharp.
+// Per row, take the leftmost/rightmost strong edge inside a central
+// band, keep rows whose width is plausible for one centred object,
+// interpolate missing rows, and fill between the edges. This is the
+// primary method; background-colour segmentation is the fallback.
+function segmentEdgeFrame(data, w, h, quads) {
+  const empty = { mask: new Uint8Array(w * h), count: 0, frac: 0, minX: w, maxX: -1,
+                  minY: h, maxY: -1, centroidX: 0 };
+  const gray = new Float32Array(w * h);
+  for (let i = 0, px = 0; px < w * h; px++, i += 4)
+    gray[px] = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+  const edge = new Uint8Array(w * h);
+  for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
+    const gx = -gray[(y - 1) * w + x - 1] + gray[(y - 1) * w + x + 1]
+             - 2 * gray[y * w + x - 1] + 2 * gray[y * w + x + 1]
+             - gray[(y + 1) * w + x - 1] + gray[(y + 1) * w + x + 1];
+    const gy = -gray[(y - 1) * w + x - 1] - 2 * gray[(y - 1) * w + x] - gray[(y - 1) * w + x + 1]
+             + gray[(y + 1) * w + x - 1] + 2 * gray[(y + 1) * w + x] + gray[(y + 1) * w + x + 1];
+    if (gx * gx + gy * gy > 120 * 120) edge[y * w + x] = 1;
+  }
+  // 3x3 dilate, so broken outline segments join up
+  const dil = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    let v = 0;
+    for (let dy = -1; dy <= 1 && !v; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const xx = x + dx, yy = y + dy;
+      if (xx >= 0 && xx < w && yy >= 0 && yy < h && edge[yy * w + xx]) { v = 1; break; }
+    }
+    dil[y * w + x] = v;
+  }
+  const x0 = Math.floor(w * 0.27), x1 = Math.floor(w * 0.74);
+  const minW = Math.max(20, Math.floor(w * 0.05)), maxW = Math.floor(w * 0.25);
+  const left = new Int32Array(h).fill(-1), right = new Int32Array(h).fill(-1);
+  const good = [];
+  for (let y = 0; y < h; y++) {
+    let l = -1, r = -1;
+    for (let x = x0; x <= x1; x++) if (dil[y * w + x]) { if (l < 0) l = x; r = x; }
+    if (l >= 0 && r - l >= minW && r - l <= maxW) { left[y] = l; right[y] = r; good.push(y); }
+  }
+  if (good.length < h * 0.2) return empty;
+  const mask = new Uint8Array(w * h);
+  for (let gi = 0; gi < good.length; gi++) {
+    const y0 = good[gi], y1 = good[gi + 1] !== undefined ? good[gi + 1] : y0;
+    const span = Math.max(1, y1 - y0);
+    for (let y = y0; y <= y1; y++) {
+      const t = (y - y0) / span;
+      const l = Math.round(left[y0] + (left[y1] - left[y0]) * t);
+      const r = Math.round(right[y0] + (right[y1] - right[y0]) * t);
+      if (r - l >= minW && r - l <= maxW) for (let x = l; x <= r; x++) mask[y * w + x] = 1;
+    }
+  }
+  // cut out any marker quad (beside the object, never touching it)
+  if (quads && quads.length) {
+    for (const q of quads) {
+      const xs = q.map(p => p.x), ys = q.map(p => p.y);
+      const bx0 = Math.max(0, Math.floor(Math.min(...xs)) - 2), bx1 = Math.min(w - 1, Math.ceil(Math.max(...xs)) + 2);
+      const by0 = Math.max(0, Math.floor(Math.min(...ys)) - 2), by1 = Math.min(h - 1, Math.ceil(Math.max(...ys)) + 2);
+      for (let y = by0; y <= by1; y++) for (let x = bx0; x <= bx1; x++) mask[y * w + x] = 0;
+    }
+  }
+  // 3x3 closing (dilate then erode) to smooth the filled shape
+  const dil2 = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    let v = 0;
+    for (let dy = -1; dy <= 1 && !v; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const xx = x + dx, yy = y + dy;
+      if (xx >= 0 && xx < w && yy >= 0 && yy < h && mask[yy * w + xx]) { v = 1; break; }
+    }
+    dil2[y * w + x] = v;
+  }
+  const clean = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    let v = 1;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const xx = x + dx, yy = y + dy;
+      if (xx < 0 || xx >= w || yy < 0 || yy >= h || !dil2[yy * w + xx]) { v = 0; break; }
+    }
+    clean[y * w + x] = v;
+  }
+  let count = 0, minX = w, maxX = -1, minY = h, maxY = -1, sumX = 0;
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    if (clean[y * w + x]) { count++; sumX += x; if (x < minX) minX = x; if (x > maxX) maxX = x; if (y < minY) minY = y; if (y > maxY) maxY = y; }
+  }
+  return { mask: clean, count, frac: count / (w * h), minX, maxX, minY, maxY,
+           centroidX: count ? sumX / count : 0 };
+}
+
 // --------------------------------------------------------------- thumbnails
 function addThumb(seg, w, h, angle) {
   const tw = 156, th = Math.max(1, Math.round(tw * h / w));
@@ -453,7 +547,7 @@ buildEl.addEventListener('click', async () => {
     const scale = Math.min(1, MAX_W / vid.videoWidth);
     const W = Math.round(vid.videoWidth * scale), H = Math.round(vid.videoHeight * scale);
     fc.width = W; fc.height = H;
-    const masks = [];
+    const frames = [];
     let bestDet = null, markerFrames = 0;
     for (let i = 0; i < views; i++) {
       const t = Math.min(t0 + (t1 - t0) * i / views, dur - 0.05);
@@ -471,9 +565,20 @@ buildEl.addEventListener('click', async () => {
           bestDet = det.best;
         }
       }
-      const seg = segmentFrame(imgData.data, W, H, thresh, det.quads);
-      masks.push(seg);
-      addThumb(seg, W, H, angle);
+      frames.push({ data: new Uint8ClampedArray(imgData.data), quads: det.quads, angle });
+      await tick();
+    }
+    // Segmentation: edge first (works for glass and gradient backgrounds),
+    // background-colour fallback if the edge masks are implausible.
+    setStatus('segmenting frames…');
+    const edgeMasks = frames.map(f => segmentEdgeFrame(f.data, W, H, f.quads));
+    const medEdge = median(edgeMasks.map(m => m.frac));
+    let masks, segMethod;
+    if (medEdge >= 0.02 && medEdge <= 0.30) { masks = edgeMasks; segMethod = 'edge'; }
+    else { masks = frames.map(f => segmentFrame(f.data, W, H, thresh, f.quads)); segMethod = 'colour'; }
+    for (let i = 0; i < frames.length; i++) {
+      fctx.putImageData(new ImageData(frames[i].data, W, H), 0, 0);
+      addThumb(masks[i], W, H, frames[i].angle);
       await tick();
     }
     // sanity checks on the masks
@@ -545,7 +650,8 @@ buildEl.addEventListener('click', async () => {
     const secs = ((performance.now() - tBegin) / 1000).toFixed(1);
     setStatus(`done in ${secs} s — ${res.voxelCount.toLocaleString()} voxels carved, ` +
       `${(res.points.length / 3).toLocaleString()} surface points ` +
-      (lastCalib ? '(true mm — ArUco calibrated)' : '(relative units)'));
+      (lastCalib ? '(true mm — ArUco calibrated)' : '(relative units)') +
+      ` — segmentation: ${segMethod}`);
   } catch (e) {
     showError(e.message || 'Something went wrong while processing this video.');
     setStatus('failed');
