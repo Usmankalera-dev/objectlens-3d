@@ -22,6 +22,7 @@ const dropEl = $('drop'), fileEl = $('fileVideo'), fileNameEl = $('fileName');
 const viewsEl = $('inViews'), threshEl = $('inThresh'), threshValEl = $('threshVal');
 const startEl = $('inStart'), endEl = $('inEnd'), markerMmEl = $('inMarkerMm');
 const buildEl = $('btnBuild'), plyEl = $('btnPly');
+const latheEl = $('chkLathe');
 const statusEl = $('scanStatus'), errorEl = $('scanError'), calibEl = $('calibStatus');
 const thumbsEl = $('thumbs'), viewerEl = $('scanViewer'), dimsEl = $('scanDims');
 const relNoteEl = $('relNote');
@@ -41,8 +42,10 @@ const fctx = fc.getContext('2d', { willReadFrequently: true });
 let videoURL = null;
 let lastPoints = null;    // Float32Array, relative units (height = 1)
 let lastCalib = null;     // null, or {pxPerMm, heightPx, frames, markerId}
+let lastMesh = null;      // lathe mesh, or null if the profile was invalid
+let lastVoxDims = null, lastVoxDimsPx = null, lastVoxRel = 1;
 let three = null;         // three.js bits, created on first result
-let pointsObj = null;
+let pointsObj = null, meshObj = null;
 
 const tick = () => new Promise(r => setTimeout(r, 0));
 const median = arr => { const s = [...arr].sort((a, b) => a - b); return s[s.length >> 1]; };
@@ -451,41 +454,49 @@ async function carveHull(masks, w, h, cx, cy, onProgress) {
 }
 
 // -------------------------------------------------------------------- viewer
+function ensureScene() {
+  if (three) return;
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(45, viewerEl.clientWidth / viewerEl.clientHeight, 0.01, 100);
+  const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+  renderer.setSize(viewerEl.clientWidth, viewerEl.clientHeight);
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  viewerEl.appendChild(renderer.domElement);
+  scene.add(new THREE.AmbientLight(0xffffff, 0.9));
+  const dir = new THREE.DirectionalLight(0xffffff, 1.2);
+  dir.position.set(1, 2, 1.5);
+  scene.add(dir);
+  const grid = new THREE.GridHelper(2.4, 24, 0x1e2c44, 0x14203a);
+  scene.add(grid);
+  const controls = new OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  controls.autoRotate = true;
+  controls.autoRotateSpeed = 1.1;
+  controls.target.set(0, 0.48, 0);
+  camera.position.set(1.05, 0.8, 1.6);
+  renderer.domElement.addEventListener('pointerdown', () => { controls.autoRotate = false; });
+  three = { scene, camera, renderer, controls };
+  (function loop() {
+    requestAnimationFrame(loop);
+    controls.update();
+    renderer.render(scene, camera);
+  })();
+  addEventListener('resize', () => {
+    camera.aspect = viewerEl.clientWidth / viewerEl.clientHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(viewerEl.clientWidth, viewerEl.clientHeight);
+  });
+}
+
+function clearViewerObjects() {
+  if (pointsObj) { three.scene.remove(pointsObj); pointsObj.geometry.dispose(); pointsObj.material.dispose(); pointsObj = null; }
+  if (meshObj) { three.scene.remove(meshObj); meshObj.geometry.dispose(); meshObj.material.dispose(); meshObj = null; }
+}
+
 function showResult(points, voxRel) {
   viewerEl.hidden = false;
-  if (!three) {
-    const scene = new THREE.Scene();
-    const camera = new THREE.PerspectiveCamera(45, viewerEl.clientWidth / viewerEl.clientHeight, 0.01, 100);
-    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-    renderer.setSize(viewerEl.clientWidth, viewerEl.clientHeight);
-    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
-    viewerEl.appendChild(renderer.domElement);
-    scene.add(new THREE.AmbientLight(0xffffff, 0.9));
-    const grid = new THREE.GridHelper(2.4, 24, 0x1e2c44, 0x14203a);
-    scene.add(grid);
-    const controls = new OrbitControls(camera, renderer.domElement);
-    controls.enableDamping = true;
-    controls.autoRotate = true;
-    controls.autoRotateSpeed = 1.1;
-    controls.target.set(0, 0.48, 0);
-    camera.position.set(1.05, 0.8, 1.6);
-    renderer.domElement.addEventListener('pointerdown', () => { controls.autoRotate = false; });
-    three = { scene, camera, renderer, controls };
-    (function loop() {
-      requestAnimationFrame(loop);
-      controls.update();
-      renderer.render(scene, camera);
-    })();
-    addEventListener('resize', () => {
-      camera.aspect = viewerEl.clientWidth / viewerEl.clientHeight;
-      camera.updateProjectionMatrix();
-      renderer.setSize(viewerEl.clientWidth, viewerEl.clientHeight);
-    });
-  }
-  if (pointsObj) {
-    three.scene.remove(pointsObj);
-    pointsObj.geometry.dispose(); pointsObj.material.dispose();
-  }
+  ensureScene();
+  clearViewerObjects();
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.BufferAttribute(points, 3));
   const mat = new THREE.PointsMaterial({
@@ -494,24 +505,170 @@ function showResult(points, voxRel) {
   three.scene.add(pointsObj);
 }
 
+function showMesh(mesh) {
+  viewerEl.hidden = false;
+  ensureScene();
+  clearViewerObjects();
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(mesh.positions, 3));
+  geo.setAttribute('normal', new THREE.BufferAttribute(mesh.normals, 3));
+  geo.setAttribute('color', new THREE.BufferAttribute(mesh.colors, 3));
+  geo.setIndex(new THREE.BufferAttribute(mesh.indices, 1));
+  const mat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.35, metalness: 0.05 });
+  meshObj = new THREE.Mesh(geo, mat);
+  three.scene.add(meshObj);
+}
+
+// ------------------------------------------------------- lathe smooth model
+// A turntable object that is (approximately) rotationally symmetric — a
+// bottle, cup, vase — is fully described by its radius profile: for each
+// image row, the silhouette's half-width, medianed across views. Revolving
+// that profile gives a smooth, solid mesh, instead of a blocky voxel
+// point cloud. This is NOT valid for non-round objects (boxes, shoes,
+// faces): for those, uncheck the lathe box and use the voxel model.
+// Returns null if fewer than 20 rows have a usable radius.
+function buildLathe(masks, w, h, cx, cy) {
+  let minY = h, maxY = -1;
+  for (const m of masks) { if (m.minY < minY) minY = m.minY; if (m.maxY > maxY) maxY = m.maxY; }
+  const heightPx = cy - minY;
+  if (heightPx < 20) return null;
+  const radii = new Float32Array(h).fill(NaN);
+  for (let y = minY; y <= cy && y < h; y++) {
+    const vals = [];
+    for (const m of masks) {
+      let l = -1, r = -1;
+      for (let x = 0; x < w; x++) if (m.mask[y * w + x]) { if (l < 0) l = x; r = x; }
+      if (l >= 0 && r - l > 0 && r - l < w * 0.8) vals.push((r - l) / 2);
+    }
+    if (vals.length) radii[y] = median(vals);
+  }
+  // interpolate rows with no data between the first and last data rows
+  let first = -1, last = -1;
+  for (let y = minY; y <= cy && y < h; y++) { if (!isNaN(radii[y])) { if (first < 0) first = y; last = y; } }
+  if (first < 0 || last - first < 20) return null;
+  for (let y = first; y <= last; y++) {
+    if (isNaN(radii[y])) {
+      let a = y - 1; while (a >= first && isNaN(radii[a])) a--;
+      let b = y + 1; while (b <= last && isNaN(radii[b])) b++;
+      radii[y] = (a >= first && b <= last) ? radii[a] + (radii[b] - radii[a]) * (y - a) / (b - a) : (a >= first ? radii[a] : radii[b]);
+    }
+  }
+  // moving-average smoothing, window 11 rows
+  const smooth = new Float32Array(h);
+  for (let y = first; y <= last; y++) {
+    let s = 0, n = 0;
+    for (let k = -5; k <= 5; k++) { const yy = y + k; if (yy >= first && yy <= last) { s += radii[yy]; n++; } }
+    smooth[y] = s / n;
+  }
+  const step = Math.max(1, Math.floor((last - first) / 100));
+  const levels = [];
+  for (let y = first; y <= last; y += step) levels.push({ hRel: (cy - y) / heightPx, rRel: smooth[y] / heightPx, y });
+  if (levels[levels.length - 1].y !== last) levels.push({ hRel: (cy - last) / heightPx, rRel: smooth[last] / heightPx, y: last });
+  const drdh = levels.map((lv, i) => {
+    if (levels.length < 2) return 0;
+    if (i === 0) return (levels[1].rRel - levels[0].rRel) / (levels[1].hRel - levels[0].hRel || 1);
+    if (i === levels.length - 1) return (levels[i].rRel - levels[i - 1].rRel) / (levels[i].hRel - levels[i - 1].hRel || 1);
+    return (levels[i + 1].rRel - levels[i - 1].rRel) / (levels[i + 1].hRel - levels[i - 1].hRel || 1);
+  });
+  const SEG = 64;
+  const positions = [], normals = [], colors = [];
+  levels.forEach((lv, i) => {
+    const cap = lv.hRel > 0.925;
+    for (let j = 0; j < SEG; j++) {
+      const th = 2 * Math.PI * j / SEG;
+      positions.push(lv.rRel * Math.cos(th), lv.hRel, lv.rRel * Math.sin(th));
+      const nx = Math.cos(th), ny = -drdh[i], nz = Math.sin(th);
+      const nl = Math.hypot(nx, ny, nz) || 1;
+      normals.push(nx / nl, ny / nl, nz / nl);
+      if (cap) colors.push(0.78, 0.78, 0.80); else colors.push(0.69, 0.76, 0.80);
+    }
+  });
+  const indices = [];
+  for (let i = 0; i < levels.length - 1; i++) for (let j = 0; j < SEG; j++) {
+    const a = i * SEG + j, b = i * SEG + (j + 1) % SEG, c = (i + 1) * SEG + (j + 1) % SEG, d = (i + 1) * SEG + j;
+    indices.push(a, b, c, a, c, d);
+  }
+  const topC = positions.length / 3;
+  positions.push(0, 1, 0); normals.push(0, 1, 0); colors.push(0.78, 0.78, 0.80);
+  const botC = positions.length / 3;
+  positions.push(0, 0, 0); normals.push(0, -1, 0); colors.push(0.69, 0.76, 0.80);
+  for (let j = 0; j < SEG; j++) indices.push(topC, (j + 1) % SEG, j);
+  const base = levels.length - 1;
+  for (let j = 0; j < SEG; j++) indices.push(botC, base * SEG + j, base * SEG + (j + 1) % SEG);
+  let maxR = 0;
+  for (const lv of levels) if (lv.rRel > maxR) maxR = lv.rRel;
+  return { positions: new Float32Array(positions), normals: new Float32Array(normals),
+           colors: new Float32Array(colors), indices: new Uint32Array(indices),
+           dims: { x: 2 * maxR, y: 1, z: 2 * maxR }, vertexCount: positions.length / 3, faceCount: indices.length / 3 };
+}
+
+function latheMode() { return !!(latheEl && latheEl.checked && lastMesh); }
+
+function currentDims() {
+  if (latheMode()) return lastMesh.dims;
+  return lastVoxDims || { x: 0, y: 1, z: 0 };
+}
+
+function updateDims() {
+  const dims = currentDims();
+  if (lastCalib) {
+    const heightMm = lastVoxDimsPx ? lastVoxDimsPx.y / lastCalib.pxPerMm : 0;
+    $('sDimX').textContent = (dims.x * heightMm).toFixed(1) + ' mm';
+    $('sDimY').textContent = heightMm.toFixed(1) + ' mm';
+    $('sDimZ').textContent = (dims.z * heightMm).toFixed(1) + ' mm';
+  } else {
+    $('sDimX').textContent = dims.x.toFixed(2);
+    $('sDimY').textContent = '1.00';
+    $('sDimZ').textContent = dims.z.toFixed(2);
+  }
+  $('sDimPts').textContent = latheMode() ? lastMesh.vertexCount.toLocaleString() : (lastPoints ? (lastPoints.length / 3).toLocaleString() : '—');
+  plyEl.textContent = latheMode() ? 'Download mesh PLY' : 'Download PLY';
+}
+
+function showCurrentModel() {
+  if (latheMode()) showMesh(lastMesh);
+  else if (lastPoints) showResult(lastPoints, lastVoxRel);
+  updateDims();
+}
+
+if (latheEl) latheEl.addEventListener('change', () => { if (lastPoints || lastMesh) showCurrentModel(); });
+
 // ---------------------------------------------------------------------- PLY
 plyEl.addEventListener('click', () => {
-  if (!lastPoints) return;
-  const n = lastPoints.length / 3;
-  // calibrated: rel points are height-normalised, so mm = rel * height in mm
+  // calibrated: rel coords are height-normalised, so mm = rel * height in mm
   const f = lastCalib ? lastCalib.heightPx / lastCalib.pxPerMm : 1;
   const comment = lastCalib
     ? `comment ObjectLens 3D browser scan - units are MILLIMETRES (ArUco-calibrated, ${lastCalib.pxPerMm.toFixed(2)} px/mm)`
     : 'comment ObjectLens 3D browser scan - RELATIVE units, height = 1.0 (no ArUco marker in video)';
-  let out = 'ply\nformat ascii 1.0\n' + comment + '\n' +
-    `element vertex ${n}\nproperty float x\nproperty float y\nproperty float z\n` +
-    'property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n';
-  for (let i = 0; i < lastPoints.length; i += 3) {
-    out += `${(lastPoints[i] * f).toFixed(4)} ${(lastPoints[i + 1] * f).toFixed(4)} ${(lastPoints[i + 2] * f).toFixed(4)} 0 255 160\n`;
+  let out, download;
+  if (latheMode()) {
+    const m = lastMesh, nv = m.positions.length / 3;
+    out = 'ply\nformat ascii 1.0\n' + comment + '\ncomment lathe smooth mesh\n' +
+      `element vertex ${nv}\nproperty float x\nproperty float y\nproperty float z\n` +
+      'property float nx\nproperty float ny\nproperty float nz\n' +
+      'property uchar red\nproperty uchar green\nproperty uchar blue\n' +
+      `element face ${m.indices.length / 3}\nproperty list uchar int vertex_indices\nend_header\n`;
+    for (let i = 0; i < nv; i++) {
+      out += `${(m.positions[i * 3] * f).toFixed(4)} ${(m.positions[i * 3 + 1] * f).toFixed(4)} ${(m.positions[i * 3 + 2] * f).toFixed(4)} ` +
+        `${m.normals[i * 3].toFixed(4)} ${m.normals[i * 3 + 1].toFixed(4)} ${m.normals[i * 3 + 2].toFixed(4)} ` +
+        `${Math.round(m.colors[i * 3] * 255)} ${Math.round(m.colors[i * 3 + 1] * 255)} ${Math.round(m.colors[i * 3 + 2] * 255)}\n`;
+    }
+    for (let i = 0; i < m.indices.length; i += 3) out += `3 ${m.indices[i]} ${m.indices[i + 1]} ${m.indices[i + 2]}\n`;
+    download = 'objectlens-mesh.ply';
+  } else {
+    if (!lastPoints) return;
+    const n = lastPoints.length / 3;
+    out = 'ply\nformat ascii 1.0\n' + comment + '\n' +
+      `element vertex ${n}\nproperty float x\nproperty float y\nproperty float z\n` +
+      'property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n';
+    for (let i = 0; i < lastPoints.length; i += 3) {
+      out += `${(lastPoints[i] * f).toFixed(4)} ${(lastPoints[i + 1] * f).toFixed(4)} ${(lastPoints[i + 2] * f).toFixed(4)} 0 255 160\n`;
+    }
+    download = 'objectlens-scan.ply';
   }
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob([out], { type: 'text/plain' }));
-  a.download = 'objectlens-scan.ply';
+  a.download = download;
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 4000);
 });
@@ -524,6 +681,8 @@ buildEl.addEventListener('click', async () => {
   plyEl.disabled = true;
   lastPoints = null;
   lastCalib = null;
+  lastMesh = null;
+  lastVoxDims = null; lastVoxDimsPx = null;
   calibEl.hidden = true;
   calibEl.classList.remove('none');
   relNoteEl.innerHTML = REL_NOTE_DEFAULT;
@@ -617,41 +776,38 @@ buildEl.addEventListener('click', async () => {
       return;
     }
     lastPoints = res.points;
-    showResult(res.points, res.voxRel);
+    lastVoxDims = res.dims; lastVoxDimsPx = res.dimsPx; lastVoxRel = res.voxRel;
+    setStatus('building smooth lathe model…');
+    lastMesh = buildLathe(masks, W, H, cx, cy);
     // ArUco calibration: the most frontal marker detection sets px-per-mm;
     // hull pixel dims / px-per-mm = true millimetres.
     if (bestDet && markerFrames > 0) {
       const pxPerMm = bestDet.meanEdge / markerMm;
       lastCalib = { pxPerMm, heightPx: res.dimsPx.y, frames: markerFrames,
                     markerId: bestDet.id };
-      $('sDimX').textContent = (res.dimsPx.x / pxPerMm).toFixed(1) + ' mm';
-      $('sDimY').textContent = (res.dimsPx.y / pxPerMm).toFixed(1) + ' mm';
-      $('sDimZ').textContent = (res.dimsPx.z / pxPerMm).toFixed(1) + ' mm';
       calibEl.textContent = `✓ Calibrated by ArUco marker (${markerFrames} frame${markerFrames === 1 ? '' : 's'}, ` +
         `${pxPerMm.toFixed(2)} px/mm) — sizes above are true millimetres.`;
       calibEl.hidden = false;
+      const cd = currentDims();
       relNoteEl.innerHTML = '<strong>True millimetres</strong> — an ArUco marker calibrated ' +
         'this scan. Relative proportions (height = 1.00): ' +
-        `${res.dims.x.toFixed(2)} × 1.00 × ${res.dims.z.toFixed(2)}. ` +
+        `${cd.x.toFixed(2)} × 1.00 × ${cd.z.toFixed(2)}. ` +
         'Single-plane caveat: the scale is exact at the marker\'s distance from the camera.';
     } else {
-      $('sDimX').textContent = res.dims.x.toFixed(2);
-      $('sDimY').textContent = '1.00';
-      $('sDimZ').textContent = res.dims.z.toFixed(2);
       calibEl.textContent = 'No ArUco marker found in the sampled frames — showing relative units. ' +
         'Print the marker (section 4), stand it beside the object and keep it visible to get true millimetres.';
       calibEl.classList.add('none');
       calibEl.hidden = false;
     }
     $('sDimViews').textContent = views;
-    $('sDimPts').textContent = (res.points.length / 3).toLocaleString();
+    showCurrentModel();
     dimsEl.hidden = false;
     plyEl.disabled = false;
     const secs = ((performance.now() - tBegin) / 1000).toFixed(1);
     setStatus(`done in ${secs} s — ${res.voxelCount.toLocaleString()} voxels carved, ` +
       `${(res.points.length / 3).toLocaleString()} surface points ` +
       (lastCalib ? '(true mm — ArUco calibrated)' : '(relative units)') +
-      ` — segmentation: ${segMethod}`);
+      ` — segmentation: ${segMethod} — model: ${latheMode() ? 'lathe smooth mesh' : 'voxel points'}`);
   } catch (e) {
     showError(e.message || 'Something went wrong while processing this video.');
     setStatus('failed');
